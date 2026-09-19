@@ -142,9 +142,47 @@ bot.Reconciler.reconcile = _reconcile_v64
 bot.VERSION = f"{bot.VERSION}-range-flat-repair-block-runtime-clear-v64"
 
 
+# v65: Principal production uses CROSS margin. This mirrors the proven
+# Direcional migration behavior without changing strategy/risk parameters.
+def _ensure_modes_cross_v65(self):
+    try:
+        if hasattr(self.client, "set_multi_assets_mode"):
+            try:
+                self.client.set_multi_assets_mode(False)
+                bot.logger.info("MODES | Single-Asset Mode confirmado")
+            except Exception as exc:
+                bot.logger.warning("MODES | Single-Asset Mode ajuste ignorado/ja aplicado | %s", exc)
+        if hasattr(self.client, "set_position_mode"):
+            try:
+                self.client.set_position_mode(True)
+            except Exception as exc:
+                bot.logger.warning("MODES | Hedge Mode ajuste ignorado/ja aplicado | %s", exc)
+        for symbol in bot.SYMBOLS:
+            self.client.set_margin_type(symbol, False)
+        bot.logger.info("MODES | Hedge Mode confirmado | CROSS solicitado em %s", ",".join(bot.SYMBOLS))
+    except Exception:
+        bot.logger.exception("MODES | Falha ao confirmar HEDGE/CROSS")
+        raise
+
+bot.AccountManager.ensure_modes = _ensure_modes_cross_v65
+
+_original_info_v65 = bot.logger.info
+def _info_cross_v65(msg, *args, **kwargs):
+    rendered = str(msg)
+    if "MARGIN=ISOLATED | MODE=HEDGE" in rendered:
+        rendered = rendered.replace("MARGIN=ISOLATED", "MARGIN=CROSS", 1)
+        msg, args = rendered, ()
+    elif "HEALTH SNAPSHOT |" in rendered and "margin=ISOLATED" in rendered:
+        rendered = rendered.replace("margin=ISOLATED", "margin=CROSS", 1)
+        msg, args = rendered, ()
+    return _original_info_v65(msg, *args, **kwargs)
+
+bot.logger.info = _info_cross_v65
+bot.VERSION = f"{bot.VERSION}-cross-v65"
+
 def main():
     bot.logger.warning(
-        "RANGE FLAT REPAIR-BLOCK CLEANUP ACTIVE | version=v64 | marker=%s | "
+        "RANGE FLAT REPAIR-BLOCK CLEANUP ACTIVE | version=v65 | margin=CROSS | marker=%s | "
         "policy=RECONCILE_OK+EXACT_STRATEGY_FLAT+NO_NATIVE_ORDER",
         MARKER,
     )
