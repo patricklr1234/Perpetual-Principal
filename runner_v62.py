@@ -391,10 +391,77 @@ bot.Reconciler.reconcile = _reconcile_v63
 bot.VERSION = f"{bot.VERSION}-stale-precedence-partial-reduction-v63"
 
 
+
+# -----------------------------------------------------------------------------
+# v64 OBSERVABILITY / PERFORMANCE METRICS (read-only; strategy behavior unchanged)
+# -----------------------------------------------------------------------------
+def _d64(v):
+    try:
+        return bot.dec(v)
+    except Exception:
+        return bot.D(0)
+
+
+def _metrics_v64(store):
+    """Build a compact, persistent-state performance snapshot without mutating state."""
+    rows = []
+    with store.lock:
+        state = store.state
+        for key, st in (state.get("range_grids", {}) or {}).items():
+            if not isinstance(st, dict):
+                continue
+            symbol = str(st.get("symbol") or str(key).split(":")[0]).upper()
+            gid = str(key).split(":")[-1]
+            eq = _d64(st.get("equity", st.get("bankroll", 0)))
+            base = bot.BTC_RANGE_GRID_BANKROLL_USD if symbol == "BTCUSDT" else bot.RANGE_GRID_BANKROLL_USD
+            rows.append((f"R:{symbol}:{gid}", "RANGE", symbol, eq, base, _d64(st.get("recovery_deficit", 0)), int(st.get("loss_streak", st.get("recovery_failures", 0)) or 0), str(st.get("status") or "IDLE")))
+        for key, st in (state.get("macd", {}) or {}).items():
+            if not isinstance(st, dict):
+                continue
+            symbol = str(st.get("symbol") or str(key).split(":")[0]).upper()
+            tf = str(st.get("timeframe") or str(key).split(":")[-1])
+            eq = _d64(st.get("equity", st.get("bankroll", 0)))
+            base = bot.BTC_INITIAL_BANKROLL_USD if symbol == "BTCUSDT" else bot.INITIAL_BANKROLL_USD
+            rows.append((f"M:{symbol}:{tf}", "MACD", symbol, eq, base, _d64(st.get("recovery_deficit", 0)), int(st.get("loss_streak", 0) or 0), "OPEN" if st.get("position") else "FLAT"))
+    by_engine = {}
+    by_symbol = {}
+    for sid, eng, sym, eq, base, rd, streak, status in rows:
+        for bucket, name in ((by_engine, eng), (by_symbol, sym)):
+            x = bucket.setdefault(name, {"equity": bot.D(0), "base": bot.D(0), "rd": bot.D(0), "units": 0})
+            x["equity"] += eq; x["base"] += base; x["rd"] += rd; x["units"] += 1
+    return rows, by_engine, by_symbol
+
+
+def log_metrics_v64(store):
+    rows, engines, symbols = _metrics_v64(store)
+    def fmt(bucket):
+        return " | ".join(f"{k}:eq={v['equity']},base={v['base']},net={v['equity']-v['base']},RD={v['rd']},units={v['units']}" for k,v in sorted(bucket.items()))
+    bot.logger.info("PERFORMANCE METRICS V64 | engines=[%s] | symbols=[%s]", fmt(engines), fmt(symbols))
+    bot.logger.info("STRATEGY METRICS V64 | %s", " | ".join(f"{sid}:eq={eq},base={base},net={eq-base},RD={rd},streak={streak},status={status}" for sid,eng,sym,eq,base,rd,streak,status in rows))
+
+
+_original_heartbeat_v64 = getattr(bot.Bot, "heartbeat", None)
+if _original_heartbeat_v64 is not None:
+    def _heartbeat_metrics_v64(self, *args, **kwargs):
+        out = _original_heartbeat_v64(self, *args, **kwargs)
+        try:
+            now = time.time()
+            last = getattr(self, "_metrics_v64_last", 0.0)
+            if now - last >= 300:
+                self._metrics_v64_last = now
+                log_metrics_v64(self.store)
+        except Exception:
+            bot.logger.exception("PERFORMANCE METRICS V64 ERROR")
+        return out
+    bot.Bot.heartbeat = _heartbeat_metrics_v64
+
+bot.VERSION = f"{bot.VERSION}-metrics-v64"
+
+
 def main():
     bot.logger.warning(
         "RANGE OWNERSHIP PRECEDENCE FIX ACTIVE | version=v63 | "
-        "policy=live-state-reservation; stale-owner-first; exact-one-live-owner repair; no-market-order"
+        "policy=live-state-reservation; stale-owner-first; exact-one-live-owner repair; no-market-order; metrics=v64-read-only"
     )
     runner.main()
 
