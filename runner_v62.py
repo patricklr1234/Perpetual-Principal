@@ -163,13 +163,13 @@ def _repair_unambiguous_stale_range_ownership(reconciler, snap):
 
 
 def _reconcile_v63(self, startup=False):
-    ok = _original_reconcile(self, startup=startup)
+    ok = _original_reconcile(self)
     if ok:
         return ok
     try:
         snap = self.account.snapshot()
         if _repair_unambiguous_stale_range_ownership(self, snap):
-            return _original_reconcile(self, startup=startup)
+            return _original_reconcile(self)
     except Exception:
         bot.logger.exception("RANGE OWNERSHIP REPAIR FAILED")
     return ok
