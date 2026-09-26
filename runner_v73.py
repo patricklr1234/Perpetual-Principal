@@ -28,11 +28,7 @@ def _qty_map_state(self):
 
 
 def _ownership_guard_v73(self):
-    """Fail closed unless physical, durable ledger and state agree.
-
-    This guard is diagnostic/protective only.  It does not mutate the ledger,
-    state lots, positions or orders.
-    """
+    """Fail closed unless physical, durable ledger and state agree."""
     ledger = self.expected_by_symbol_side()
     state = _qty_map_state(self)
     snap = self.snapshot()
@@ -128,8 +124,6 @@ def main():
         "automatic_orphan_adoption=DISABLED | market_orders=NONE | "
         "positions=UNTOUCHED | fail_closed=True"
     )
-    # v72 main keeps the full v72 migration/tick behavior and ultimately
-    # invokes the production bot entrypoint.
     base.main()
 
 
