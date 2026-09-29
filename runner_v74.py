@@ -140,6 +140,18 @@ def _clear_quarantine_if_resolved(self):
 
 
 def _reconcile_v74(self, *args, **kwargs):
+    # Detect the one safe/scoped case BEFORE V73 reconciliation. V73 would
+    # otherwise intentionally emit a global mismatch error/soft-kill first,
+    # only for V74 to release it immediately afterward. That creates noisy
+    # false alarms and a needless kill-switch transition.
+    mismatches = _collect_mismatches(self)
+    if _physical_only_unknown(mismatches):
+        _set_quarantine(self, mismatches)
+        return True
+
+    # Any other mismatch must still pass through V73's original fail-closed
+    # reconciliation. Never weaken protection for ledger/state divergence,
+    # unknown strategy ownership, or partial mismatches.
     ok = _original_reconcile_v73(self, *args, **kwargs)
     mismatches = _collect_mismatches(self)
 
