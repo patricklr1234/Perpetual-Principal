@@ -1730,6 +1730,18 @@ class FillLedger:
             ).fetchall()
         return sum((dec(row[0]) for row in rows), D(0))
 
+    def order_owner_by_order_id(self, order_id: Any) -> Optional[str]:
+        """Resolve ownership from the exchange numeric orderId when Aster omits clientOrderId in userTrades."""
+        oid = str(order_id or "")
+        if not oid:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT strategy_id FROM orders WHERE order_id=? ORDER BY updated_ms DESC LIMIT 1",
+                (oid,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
     def order_owner(self, client_id: str) -> Optional[str]:
         """Return durable strategy ownership for a known clientOrderId, if any."""
         cid = str(client_id or "")
@@ -4593,7 +4605,13 @@ class Reconciler:
                     continue
                 cid = str(row.get("clientOrderId") or row.get("origClientOrderId") or "")
                 trade_side = str(row.get("side") or "").upper()
-                if cid.startswith(ExecutionEngine.PREFIX + "-"):
+                owner = None
+                if cid:
+                    owner = self.ledger.order_owner(cid)
+                if owner is None:
+                    owner = self.ledger.order_owner_by_order_id(row.get("orderId"))
+                bot_owned = cid.startswith(ExecutionEngine.PREFIX + "-") or (owner is not None and str(owner).startswith(("RANGE:", "MACD:", "RECOVERY:")))
+                if bot_owned:
                     increases = (side == "LONG" and trade_side == "BUY") or (side == "SHORT" and trade_side == "SELL")
                     bot_net += qty if increases else -qty
                 else:
