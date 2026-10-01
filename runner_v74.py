@@ -194,7 +194,7 @@ def _recover_forensic_hype_g0(self):
     leg_id = "FORENSIC-HYPE-G0-LONG-20260928"
     with self.store.lock:
         # Idempotence: do not duplicate the recovered leg.
-        existing = self.exe.ledger.open_lots_for_symbol_side("HYPEUSDT", "LONG")
+        existing = self.ledger.open_lots_for_symbol_side("HYPEUSDT", "LONG")
         if any(str(x.get("id")) == leg_id for x in existing):
             _FORENSIC_HYPE_RECOVERY_DONE = True
             return True
@@ -263,6 +263,15 @@ def _recover_forensic_hype_g0(self):
     return True
 
 def _reconcile_v74(self, *args, **kwargs):
+    # Exact audited HYPE residual: restore ownership before generic quarantine.
+    try:
+        if _recover_forensic_hype_g0(self):
+            return True
+    except Exception as exc:
+        bot.logger.exception("FORENSIC HYPE G0 RESTORE FAILED | fail_closed=True | %s", exc)
+        self.store.set_trade_gate(False, f"FORENSIC_HYPE_G0_RESTORE_FAILED:{exc}")
+        return False
+
     # Detect the one safe/scoped case BEFORE V73 reconciliation. V73 would
     # otherwise intentionally emit a global mismatch error/soft-kill first,
     # only for V74 to release it immediately afterward. That creates noisy
