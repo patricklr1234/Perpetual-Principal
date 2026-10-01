@@ -3,13 +3,16 @@
 """Perpetual Principal production entrypoint v74.
 
 V74 resolves a narrow operational deadlock introduced by V73 fail-closed
-ownership protection: an unknown physical position on one symbol must not halt
-unrelated symbols.
+ownership protection: a physical position whose durable ownership was lost must
+not be mislabeled as manual/external when the exchange trade history proves it
+was created by this bot.
 
 Safety rules:
-- NEVER adopt the unknown position into ledger/state;
-- NEVER close, reduce, cancel, or otherwise mutate the unknown position/orders;
-- quarantine the affected symbol only;
+- NEVER adopt an unproven position into ledger/state;
+- ONLY recover a residual when the exchange trade history proves bot ownership
+  and contains no external/manual trade on the same symbol/positionSide;
+- recover proven bot residuals through the normal ExecutionEngine, never manually;
+- otherwise quarantine the affected symbol only;
 - allow unaffected symbols to continue when the ONLY mismatch is
   physical > 0 while ledger == state == 0;
 - if any other mismatch exists, preserve V73 global fail-closed behavior;
@@ -146,8 +149,24 @@ def _reconcile_v74(self, *args, **kwargs):
     # false alarms and a needless kill-switch transition.
     mismatches = _collect_mismatches(self)
     if _physical_only_unknown(mismatches):
-        _set_quarantine(self, mismatches)
-        return True
+        recovered = []
+        for (symbol, side), physical, ledger, state in list(mismatches):
+            if self._recover_proven_bot_residual(symbol, side, physical):
+                recovered.append((symbol, side, physical))
+        if recovered:
+            remaining = _collect_mismatches(self)
+            if not remaining:
+                self.store.set_trade_gate(True, None)
+                _clear_quarantine_if_resolved(self)
+                bot.logger.warning(
+                    "V74 PROVEN BOT OWNERSHIP RECOVERY COMPLETE | recovered=%s | quarantine=RELEASED",
+                    recovered,
+                )
+                return True
+            mismatches = remaining
+        if _physical_only_unknown(mismatches):
+            _set_quarantine(self, mismatches)
+            return True
 
     # Any other mismatch must still pass through V73's original fail-closed
     # reconciliation. Never weaken protection for ledger/state divergence,
