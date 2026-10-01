@@ -4572,6 +4572,65 @@ class Reconciler:
                 out.append((key, lq, sq))
         return out
 
+    def _prove_bot_owned_residual(self, symbol: str, side: str, physical_qty: Decimal) -> bool:
+        """Prova ownership pela trilha de trades da própria API Wallet."""
+        symbol = str(symbol).upper(); side = str(side).upper()
+        step = self.rules.rules[symbol].step_size if symbol in self.rules.rules else D("0.00000001")
+        if physical_qty < step:
+            return False
+        try:
+            start_ms = now_ms() - 14 * 24 * 60 * 60 * 1000
+            rows = self.client.user_trades(symbol, start_ms=start_ms, limit=1000)
+            if not isinstance(rows, list) or not rows:
+                return False
+            bot_net = D(0)
+            external_trades = []
+            for row in rows:
+                if str(row.get("positionSide") or "").upper() != side:
+                    continue
+                qty = abs(dec(row.get("qty") or row.get("executedQty")))
+                if qty <= 0:
+                    continue
+                cid = str(row.get("clientOrderId") or row.get("origClientOrderId") or "")
+                trade_side = str(row.get("side") or "").upper()
+                if cid.startswith(ExecutionEngine.PREFIX + "-"):
+                    increases = (side == "LONG" and trade_side == "BUY") or (side == "SHORT" and trade_side == "SELL")
+                    bot_net += qty if increases else -qty
+                else:
+                    external_trades.append({"cid": cid, "side": trade_side, "qty": str(qty), "orderId": row.get("orderId")})
+            if external_trades:
+                logger.warning("OWNERSHIP PROOF INCONCLUSIVA | %s %s | external_trades=%s | physical=%s", symbol, side, external_trades[:8], physical_qty)
+                return False
+            proven = abs(bot_net - physical_qty) < step
+            logger.warning("OWNERSHIP PROOF | %s %s | physical=%s bot_net=%s proven=%s", symbol, side, physical_qty, bot_net, proven)
+            return proven
+        except Exception as exc:
+            logger.warning("OWNERSHIP PROOF QUERY FAIL | %s %s | %s", symbol, side, exc)
+            return False
+
+    def _recover_proven_bot_residual(self, symbol: str, side: str, physical_qty: Decimal) -> bool:
+        """Fecha somente residual comprovadamente criado pelo próprio Principal."""
+        if not self._prove_bot_owned_residual(symbol, side, physical_qty):
+            return False
+        recovery_id = f"RECOVERY:PROVEN_BOT_RESIDUAL:{symbol}:{side}"
+        try:
+            self.store.set_trade_gate(False, f"PROVEN_BOT_RESIDUAL_RECOVERY:{symbol}:{side}:{physical_qty}")
+            snap = self.snapshot()
+            ref_price = snap.entries.get((symbol, side), D(0))
+            fill = self.exe.market(recovery_id, symbol, side, physical_qty, False, ref_price)
+            closed = dec(fill.get("qty"))
+            if closed < physical_qty:
+                raise RuntimeError(f"residual recovery partial: requested={physical_qty} closed={closed}")
+            remaining = self.snapshot().positions.get((symbol, side), D(0))
+            if remaining >= (self.rules.rules[symbol].step_size if symbol in self.rules.rules else D("0.00000001")):
+                raise RuntimeError(f"residual recovery deixou posição física: {symbol} {side} remaining={remaining}")
+            jsonl_append(TRADES_FILE, {"event":"PROVEN_BOT_RESIDUAL_RECOVERY","strategy":recovery_id,"symbol":symbol,"side":side,"qty":str(closed),"price":str(fill.get("price")),"reason":"OWNERSHIP_PROVEN_BY_BOT_TRADE_HISTORY","at":now_iso()})
+            logger.critical("OWNERSHIP RESOLVED | %s %s | recovered_bot_residual=%s price=%s | physical_now=%s", symbol, side, closed, fill.get("price"), remaining)
+            return True
+        except Exception as exc:
+            logger.exception("OWNERSHIP RESIDUAL RECOVERY FAIL | %s %s | %s", symbol, side, exc)
+            return False
+
     def reconcile(self) -> bool:
         if not LIVE_TRADING:
             self.store.set_trade_gate(True, None); return True
@@ -4619,6 +4678,23 @@ class Reconciler:
                     if abs(e - a) >= step:
                         mismatches.append((k, e, a))
                 logger.warning("RECONCILE | SIDE AUTO-REPAIR RESULT | repaired=%s remaining=%s", repaired_sides, mismatches)
+            if mismatches:
+                recovered_residuals = []
+                for (sym, side), exp_qty, act_qty in list(mismatches):
+                    step = self.rules.rules[sym].step_size if sym in self.rules.rules else D("0.00000001")
+                    if exp_qty < step and act_qty >= step:
+                        if self._recover_proven_bot_residual(sym, side, act_qty):
+                            recovered_residuals.append((sym, side, act_qty))
+                if recovered_residuals:
+                    expected = self.expected_by_symbol_side()
+                    snap = self.snapshot(); actual = snap.positions
+                    mismatches = []
+                    for k in set(expected) | set(actual):
+                        e = expected.get(k, D(0)); a = actual.get(k, D(0))
+                        step = self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
+                        if abs(e - a) >= step:
+                            mismatches.append((k, e, a))
+                    logger.warning("RECONCILE | PROVEN BOT RESIDUAL RESULT | recovered=%s remaining=%s", recovered_residuals, mismatches)
             if mismatches:
                 reason = f"POSITION_MISMATCH_LEDGER expected_vs_actual={mismatches}"
                 self.store.set_trade_gate(False, reason)
