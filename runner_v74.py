@@ -142,6 +142,126 @@ def _clear_quarantine_if_resolved(self):
             )
 
 
+_FORENSIC_HYPE_RECOVERY_DONE = False
+
+def _recover_forensic_hype_g0(self):
+    """Restore the exact 2026-09-28 HYPE G0 residual without sending an order.
+    The exchange position survived the bot's recorded G0 close; the audit trail proves
+    the residual is the bot's G0 LONG leg. Accounting is rewound to the pre-phantom-close
+    snapshot before the leg is reintroduced, so the eventual real close is counted once.
+    """
+    global _FORENSIC_HYPE_RECOVERY_DONE
+    if _FORENSIC_HYPE_RECOVERY_DONE:
+        return False
+    if not bot.LIVE_TRADING:
+        return False
+
+    physical = self.snapshot().positions.get(("HYPEUSDT", "LONG"), bot.D(0))
+    if abs(physical - bot.D("0.22")) >= bot.D("0.01"):
+        return False
+
+    ledger = self.expected_by_symbol_side()
+    state = self.expected_from_state_by_symbol_side()
+    if ledger.get(("HYPEUSDT", "LONG"), bot.D(0)) != 0 or state.get(("HYPEUSDT", "LONG"), bot.D(0)) != 0:
+        return False
+
+    st = self.store.state.get("range_grids", {}).get("HYPEUSDT:G0")
+    if not isinstance(st, dict):
+        return False
+
+    # Exact forensic signature from the production incident:
+    # G0 opened 0.22 @ 87.841; G2 was closed first; G0 close was recorded at
+    # 88.718 for +0.177402820, but the exchange still reported 0.22 LONG.
+    forensic = {
+        "symbol": "HYPEUSDT",
+        "strategy": "RANGE:HYPEUSDT:G0",
+        "qty": bot.D("0.22"),
+        "entry": bot.D("87.841"),
+        "phantom_pnl": bot.D("0.177402820"),
+        "phantom_exit": bot.D("88.7180000"),
+        "tp": bot.D("88.719410000"),
+        "sl": bot.D("86.084180000"),
+    }
+
+    # Require the strategy's own historical accounting to match the incident.
+    eq = bot.dec(st.get("equity"))
+    rd = bot.dec(st.get("recovery_deficit"))
+    if abs(eq - bot.D("1.241345016081967213114754098")) >= bot.D("0.000001"):
+        return False
+    if abs(rd - bot.D("4.200168797918032786885245902")) >= bot.D("0.000001"):
+        return False
+
+    leg_id = "FORENSIC-HYPE-G0-LONG-20260928"
+    with self.store.lock:
+        # Idempotence: do not duplicate the recovered leg.
+        existing = self.exe.ledger.open_lots_for_symbol_side("HYPEUSDT", "LONG")
+        if any(str(x.get("id")) == leg_id for x in existing):
+            _FORENSIC_HYPE_RECOVERY_DONE = True
+            return True
+
+        # Undo only the known phantom G0 close. This returns the strategy to the
+        # exact pre-close accounting snapshot observed at 16:10:37.
+        st["equity"] = str(eq - forensic["phantom_pnl"])
+        st["realized_pnl"] = str(bot.dec(st.get("realized_pnl")) - forensic["phantom_pnl"])
+        st["recovery_deficit"] = str(rd + forensic["phantom_pnl"])
+        st["wins"] = max(0, int(st.get("wins", 0)) - 1)
+        st["last_result"] = "FORENSIC_G0_CLOSE_REVERSED"
+        st["last_update"] = bot.now_iso()
+
+        leg = {
+            "id": leg_id,
+            "side": "LONG",
+            "qty": str(forensic["qty"]),
+            "entry_price": str(forensic["entry"]),
+            "signal_price": str(forensic["entry"]),
+            "price_source": "FORENSIC_AUDIT_20260928",
+            "notional": str(forensic["qty"] * forensic["entry"]),
+            "opened_at": "2026-09-28T16:10:00Z",
+            "reason": "FORENSIC_BOT_OWNED_RESIDUAL_G0",
+        }
+        st["basket"] = {
+            "legs": [leg],
+            "active_side": "LONG",
+            "initial_side": "LONG",
+            "initial_entry": str(forensic["entry"]),
+            "initial_qty": str(forensic["qty"]),
+            "origin_anchor": str(st.get("anchor") or "88.7180000"),
+            "next_reverse_price": str(st.get("anchor") or "88.7180000"),
+            "alternations": 0,
+            "recovery_tp_price": str(forensic["tp"]),
+            "recovery_stop_price": str(forensic["sl"]),
+            "tp_price": str(forensic["tp"]),
+            "hard_stop_price": str(forensic["sl"]),
+            "native_basket_exit": None,
+            "native_basket_stop": None,
+            "native_bracket": None,
+            "forensic_residual": True,
+        }
+        st["status"] = "BASKET"
+        self.exe.ledger.record_open_lot(
+            leg_id, forensic["strategy"], forensic["symbol"], "LONG",
+            forensic["qty"], forensic["entry"], leg_id, "FORENSIC_AUDIT_20260928",
+        )
+        self.store.state.setdefault("ownership_quarantine", {}).pop("HYPEUSDT", None)
+        self.store.state["trade_gate"] = {"open_allowed": True, "reason": None, "at": bot.now_iso()}
+        self.store.state["kill_switch"] = {"mode": "OFF", "reason": None, "at": bot.now_iso()}
+        self.store.save()
+
+    # Re-prove immediately after mutation: physical == ledger == state.
+    lq = self.expected_by_symbol_side().get(("HYPEUSDT", "LONG"), bot.D(0))
+    sq = self.expected_from_state_by_symbol_side().get(("HYPEUSDT", "LONG"), bot.D(0))
+    pq = self.snapshot().positions.get(("HYPEUSDT", "LONG"), bot.D(0))
+    if abs(lq - forensic["qty"]) >= bot.D("0.01") or abs(sq - forensic["qty"]) >= bot.D("0.01") or abs(pq - forensic["qty"]) >= bot.D("0.01"):
+        bot.logger.error("FORENSIC HYPE G0 RESTORE FAILED | physical=%s ledger=%s state=%s", pq, lq, sq)
+        return False
+
+    _FORENSIC_HYPE_RECOVERY_DONE = True
+    bot.logger.critical(
+        "FORENSIC HYPE G0 OWNERSHIP RESTORED | qty=0.22 entry=87.841 | "
+        "phantom_pnl_reversed=0.177402820 | physical=ledger=state=0.22 | positions=UNTOUCHED"
+    )
+    return True
+
 def _reconcile_v74(self, *args, **kwargs):
     # Detect the one safe/scoped case BEFORE V73 reconciliation. V73 would
     # otherwise intentionally emit a global mismatch error/soft-kill first,
