@@ -4617,7 +4617,50 @@ class Reconciler:
                 else:
                     external_trades.append({"cid": cid, "side": trade_side, "qty": str(qty), "orderId": row.get("orderId")})
             if external_trades:
-                logger.warning("OWNERSHIP PROOF INCONCLUSIVA | %s %s | external_trades=%s | physical=%s", symbol, side, external_trades[:8], physical_qty)
+                # Aster can omit clientOrderId in userTrades. Before failing closed,
+                # use the bot's durable trades.jsonl as a second, independent provenance proof.
+                journal_net = D(0)
+                journal_seen = 0
+                try:
+                    if TRADES_FILE.exists():
+                        cutoff_ms = now_ms() - 14 * 24 * 60 * 60 * 1000
+                        with TRADES_FILE.open("r", encoding="utf-8") as fh:
+                            for raw in fh:
+                                try:
+                                    ev = json.loads(raw)
+                                except Exception:
+                                    continue
+                                if str(ev.get("symbol") or "").upper() != symbol:
+                                    continue
+                                strategy = str(ev.get("strategy") or "")
+                                if not strategy.startswith(("RANGE:", "MACD:", "RECOVERY:")):
+                                    continue
+                                at = str(ev.get("at") or "")
+                                if at:
+                                    try:
+                                        dt = datetime.fromisoformat(at.replace("Z", "+00:00"))
+                                        if int(dt.timestamp() * 1000) < cutoff_ms:
+                                            continue
+                                    except Exception:
+                                        pass
+                                if str(ev.get("event") or "").upper() == "OPEN":
+                                    leg = ev.get("leg") or {}
+                                    if str(leg.get("side") or "").upper() != side:
+                                        continue
+                                    q = dec(leg.get("qty"))
+                                    journal_net += q; journal_seen += 1
+                                elif str(ev.get("event") or "").upper() == "CLOSE":
+                                    close = ev.get("close") or {}
+                                    if str(close.get("side") or "").upper() != side:
+                                        continue
+                                    q = dec(close.get("qty"))
+                                    journal_net -= q; journal_seen += 1
+                except Exception as journal_exc:
+                    logger.warning("OWNERSHIP JOURNAL PROOF FAIL | %s %s | %s", symbol, side, journal_exc)
+                if journal_seen and abs(journal_net - physical_qty) < step:
+                    logger.warning("OWNERSHIP PROOF JOURNAL | %s %s | physical=%s journal_net=%s proven=True", symbol, side, physical_qty, journal_net)
+                    return True
+                logger.warning("OWNERSHIP PROOF INCONCLUSIVA | %s %s | external_trades=%s | bot_net=%s journal_net=%s physical=%s", symbol, side, external_trades[:8], bot_net, journal_net, physical_qty)
                 return False
             proven = abs(bot_net - physical_qty) < step
             logger.warning("OWNERSHIP PROOF | %s %s | physical=%s bot_net=%s proven=%s", symbol, side, physical_qty, bot_net, proven)
