@@ -1,21 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Process-wide safety shim for bounded FileHandler logs.
+"""Process-wide safety shim for bounded persistent logging.
 
-Python imports ``sitecustomize`` automatically during interpreter startup when
-this repository is on sys.path (the normal ``python runner.py`` Railway launch).
-This keeps the existing production entrypoint unchanged while making ordinary
-``logging.FileHandler`` instances bounded. It does not touch stdout handlers,
-strategy/risk parameters, state, ledger, bankrolls, orders, positions, BOT_DIR,
-or the Railway Volume.
+This module is imported by Python during interpreter startup.  It keeps the
+existing production entrypoint intact while making the persistent bot log
+bounded and self-recovering when a previous log flood has exhausted /data.
+It does not modify state, ledger, bankrolls, orders, positions or BOT_DIR.
 """
 
 import logging
 import os
 
-_MAX_BYTES = 10 * 1024 * 1024
-_BACKUP_COUNT = 4
+_MAX_BYTES = 2 * 1024 * 1024
+_BACKUP_COUNT = 2
+_RECOVERY_KEEP_BYTES = 512 * 1024
+_LOG_BASENAME = "aster_bot.log"
 _OriginalFileHandler = logging.FileHandler
+
+
+def _recover_persistent_log_space() -> None:
+    """Free only obsolete log bytes before the application opens the log.
+
+    This is intentionally limited to the bot's persistent log and its rotated
+    copies.  Trading state, SQLite ledger, trade journal and order journal are
+    never deleted or truncated here.
+    """
+    try:
+        log_path = os.path.join(os.getenv("BOT_DIR", "/data"), _LOG_BASENAME)
+        # Remove only rotated copies created by previous bounded-log versions.
+        for idx in range(1, 10):
+            rotated = f"{log_path}.{idx}"
+            try:
+                if os.path.exists(rotated):
+                    os.remove(rotated)
+            except OSError:
+                pass
+
+        if not os.path.exists(log_path):
+            return
+
+        size = os.path.getsize(log_path)
+        if size <= _RECOVERY_KEEP_BYTES:
+            return
+
+        # Read only the tail, truncate first to release space even when the
+        # filesystem is completely full, then restore the small tail.
+        with open(log_path, "rb") as src:
+            src.seek(max(0, size - _RECOVERY_KEEP_BYTES))
+            tail = src.read(_RECOVERY_KEEP_BYTES)
+        with open(log_path, "wb") as dst:
+            dst.write(tail)
+    except Exception:
+        # Logging/storage recovery must never prevent the trading process from
+        # starting. The normal handler below remains fail-safe as well.
+        pass
+
+
+_recover_persistent_log_space()
 
 
 class _BoundedFileHandler(_OriginalFileHandler):
@@ -35,8 +76,6 @@ class _BoundedFileHandler(_OriginalFileHandler):
             current = os.path.getsize(self.baseFilename)
             return current > 0 and current + len(encoded) >= _MAX_BYTES
         except Exception:
-            # Logging must never take the trading process down. If the size check
-            # itself is unavailable, fall back to the original FileHandler emit.
             return False
 
     def _rotate(self):
@@ -93,8 +132,4 @@ class _BoundedFileHandler(_OriginalFileHandler):
             self.handleError(record)
 
 
-# main.py currently constructs the persistent /data/aster_bot.log with
-# logging.FileHandler. Replacing that class here means the existing runner.py
-# needs no entrypoint change and the production redeploy automatically picks up
-# bounded rotation.
 logging.FileHandler = _BoundedFileHandler
