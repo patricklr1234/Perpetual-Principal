@@ -2,10 +2,16 @@
 # -*- coding: utf-8 -*-
 """Perpetual Principal production entrypoint v75.
 
-Completes the durable-ledger -> state projection repair before the V74
-ownership guard.  It never changes exchange positions or open orders.
+Completes the deterministic reconciliation path before the V74 ownership guard:
+- repair proven RANGE state orphans through the existing safe reconciler routine;
+- strengthen bot-ownership proof with the durable order journal when Aster userTrades
+  omit clientOrderId, without adopting unproven exposure;
+- then run the original V74 proven-residual recovery/quarantine logic.
+
+No manual exchange action is performed by this wrapper.
 """
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -31,115 +37,153 @@ def _recover_log_storage():
 _recover_log_storage()
 
 import runner_v74 as base  # noqa: E402
-import runner_v69 as repair_base  # noqa: E402
 
 bot = base.bot
 _original_reconcile_v74 = bot.Reconciler.reconcile
+_original_prove_residual_v74 = bot.Reconciler._prove_bot_owned_residual
 
 
-def _exact_owned_state_restore(self):
-    ledger = self.expected_by_symbol_side()
-    state = self.expected_from_state_by_symbol_side()
-    physical = self.snapshot().positions
-    represented = self._represented_state_leg_ids()
-    repairs = []
+def _journal_bot_order_ids():
+    """Read only durable order-journal provenance; never mutates the journal."""
+    path = Path(os.getenv("BOT_DIR", "/data")) / "order_journal.jsonl"
+    client_ids = set()
+    order_ids = set()
+    try:
+        if not path.exists():
+            return client_ids, order_ids
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                try:
+                    ev = json.loads(raw)
+                except Exception:
+                    continue
+                strategy = str(ev.get("strategy") or ev.get("strategy_id") or "")
+                cid = str(ev.get("clientOrderId") or ev.get("client_order_id") or ev.get("cid") or "")
+                oid = str(ev.get("orderId") or ev.get("order_id") or "")
+                bot_owned = strategy.startswith(("RANGE:", "MACD:", "RECOVERY:", "PROVEN_BOT_RESIDUAL:")) or cid.startswith("a3-")
+                if bot_owned:
+                    if cid:
+                        client_ids.add(cid)
+                    if oid:
+                        order_ids.add(oid)
+    except Exception as exc:
+        bot.logger.warning("OWNERSHIP JOURNAL INDEX FAIL | %s", exc)
+    return client_ids, order_ids
 
-    for key in sorted(set(ledger) | set(state) | set(physical)):
-        symbol, side = key
-        lq = ledger.get(key, bot.D(0))
-        sq = state.get(key, bot.D(0))
-        pq = physical.get(key, bot.D(0))
-        step = self.rules.rules[symbol].step_size
-        if lq <= 0 or abs(lq - pq) >= step or abs(lq - sq) < step:
-            continue
 
-        missing = lq - sq
-        lots = self.ledger.open_lots_for_symbol_side(symbol, side)
-        candidates = [x for x in lots if str(x.get("id") or "") not in represented]
-        if not candidates:
-            continue
-        if abs(sum((bot.dec(x.get("qty")) for x in candidates), bot.D(0)) - missing) >= step:
-            continue
+def _prove_bot_owned_residual_v75(self, symbol, side, physical_qty):
+    """Stronger proof: every relevant exchange trade must be attributable to the bot.
 
-        planned = []
-        safe = True
-        with self.store.lock:
-            for lot in candidates:
-                sid = str(lot.get("strategy_id") or "")
-                if not self._is_current_range_grid_strategy(sid, symbol):
-                    safe = False
-                    break
-                st = self._range_state_for_strategy(sid)
-                basket = st.get("basket") if isinstance(st, dict) else None
-                if not isinstance(basket, dict) or not isinstance(basket.get("legs"), list):
-                    safe = False
-                    break
-                if any(str(x.get("id") or "") == str(lot.get("id") or "") for x in basket["legs"]):
-                    safe = False
-                    break
-                planned.append((sid, st, basket, lot))
+    Exact net quantity is preferred, but it is not the only ownership proof. If Aster
+    omits clientOrderId on one or more fills, a matching durable order-journal orderId/
+    clientOrderId is sufficient provenance. Quantity mismatch is treated as an accounting
+    defect, not as evidence of manual ownership, provided no external trade exists.
+    """
+    try:
+        if _original_prove_residual_v74(self, symbol, side, physical_qty):
+            return True
+    except Exception as exc:
+        bot.logger.warning("OWNERSHIP BASE PROOF ERROR | %s %s | %s", symbol, side, exc)
 
-        if not safe or not planned:
-            continue
+    symbol = str(symbol).upper()
+    side = str(side).upper()
+    step = self.rules.rules[symbol].step_size if symbol in self.rules.rules else bot.D("0.00000001")
+    if physical_qty < step:
+        return False
 
-        block = f"RANGE_STATE_EXACT_OWNED_RESTORE:{symbol}:{side}"
-        self.store.set_operational_block(block, f"ledger=physical={lq} state={sq} missing={missing}")
-        try:
-            with self.store.lock:
-                if any(str(lot.get("id") or "") in self._represented_state_leg_ids() for _, _, _, lot in planned):
-                    raise RuntimeError("state changed before exact restore")
-                for sid, st, basket, lot in planned:
-                    q = bot.dec(lot.get("qty"))
-                    ep = bot.dec(lot.get("entry_price"))
-                    basket["legs"].append({
-                        "id": str(lot.get("id")),
-                        "side": side,
-                        "qty": str(q),
-                        "entry_price": str(ep),
-                        "signal_price": str(ep),
-                        "price_source": "DURABLE_LEDGER_RESTORE_EXACT",
-                        "notional": str(q * ep),
-                        "opened_at": bot.now_iso(),
-                        "reason": "STATE_EXACT_OWNED_RESTORE",
-                    })
-                    st["last_update"] = bot.now_iso()
-                    st["last_result"] = "STATE_EXACT_OWNED_RESTORED"
-                self.store.save()
-            after = self.expected_from_state_by_symbol_side().get(key, bot.D(0))
-            if abs(after - lq) >= step:
-                raise RuntimeError(f"post-restore proof failed: state={after} ledger={lq}")
-            self.store.set_operational_block(block, None)
-            repairs.append((symbol, side, missing))
-            bot.logger.warning(
-                "EXACT OWNED STATE RESTORE | repairs=%s | ledger=physical=state | positions=UNTOUCHED orders=UNTOUCHED",
-                repairs,
+    try:
+        start_ms = bot.now_ms() - 14 * 24 * 60 * 60 * 1000
+        rows = self.client.user_trades(symbol, start_ms=start_ms, limit=1000)
+        if not isinstance(rows, list) or not rows:
+            return False
+        journal_cids, journal_oids = _journal_bot_order_ids()
+        relevant = []
+        unknown = []
+        bot_net = bot.D(0)
+        for row in rows:
+            if str(row.get("positionSide") or "").upper() != side:
+                continue
+            qty = abs(bot.dec(row.get("qty") or row.get("executedQty")))
+            if qty <= 0:
+                continue
+            cid = str(row.get("clientOrderId") or row.get("origClientOrderId") or "")
+            oid = str(row.get("orderId") or "")
+            owner = self.ledger.order_owner(cid) if cid else None
+            if owner is None and oid:
+                owner = self.ledger.order_owner_by_order_id(oid)
+            bot_owned = (
+                cid.startswith("a3-")
+                or (owner is not None and str(owner).startswith(("RANGE:", "MACD:", "RECOVERY:")))
+                or cid in journal_cids
+                or oid in journal_oids
             )
-        except Exception as exc:
-            self.store.set_operational_block(block, f"EXACT_RESTORE_FAILED:{exc}")
-            bot.logger.exception("EXACT OWNED STATE RESTORE FAILED | %s %s | %s", symbol, side, exc)
+            trade_side = str(row.get("side") or "").upper()
+            relevant.append((row, bot_owned))
+            if not bot_owned:
+                unknown.append({"cid": cid, "orderId": oid, "side": trade_side, "qty": str(qty)})
+            else:
+                increases = (side == "LONG" and trade_side == "BUY") or (side == "SHORT" and trade_side == "SELL")
+                bot_net += qty if increases else -qty
 
-    return repairs
+        if not relevant or unknown:
+            bot.logger.warning(
+                "OWNERSHIP PROOF JOURNAL-ENHANCED | %s %s | physical=%s bot_net=%s unknown_or_external=%s proven=False",
+                symbol, side, physical_qty, bot_net, unknown[:8],
+            )
+            return False
+
+        # All relevant exchange trades are attributable to the bot. A quantity mismatch
+        # is therefore an internal reconciliation/accounting mismatch, not an external
+        # ownership proof. The existing recovery path will close only the physical residual.
+        bot.logger.critical(
+            "OWNERSHIP PROOF JOURNAL-ENHANCED | %s %s | physical=%s bot_net=%s all_trades_bot_owned=True proven=True",
+            symbol, side, physical_qty, bot_net,
+        )
+        return True
+    except Exception as exc:
+        bot.logger.warning("OWNERSHIP ENHANCED PROOF FAIL | %s %s | %s", symbol, side, exc)
+        return False
+
+
+bot.Reconciler._prove_bot_owned_residual = _prove_bot_owned_residual_v75
+
+
+def _repair_state_orphans_before_v74(self):
+    try:
+        expected = self.expected_by_symbol_side()
+        state_mismatches = self.state_ledger_mismatches(expected)
+        if not state_mismatches:
+            return []
+        actual = self.snapshot().positions
+        repaired = self._repair_range_state_orphans(state_mismatches, actual)
+        if repaired:
+            bot.logger.warning(
+                "V75 RANGE STATE ORPHAN REPAIR BEFORE OWNERSHIP GUARD | repaired=%s | invoking V74 after repair",
+                repaired,
+            )
+        return repaired
+    except Exception as exc:
+        bot.logger.exception("V75 RANGE STATE ORPHAN PRE-REPAIR FAILED | fail_closed=True | %s", exc)
+        return []
 
 
 def _reconcile_v75(self, *args, **kwargs):
     try:
-        repaired = _exact_owned_state_restore(self)
-        if not repaired:
-            repaired = repair_base._restore_missing_live_range_lots_v69(self)
-        if repaired:
-            bot.logger.warning("STATE PROJECTION REPAIR COMPLETE | repairs=%s | invoking authoritative reconcile", repaired)
+        _repair_state_orphans_before_v74(self)
     except Exception as exc:
-        bot.logger.exception("STATE PROJECTION REPAIR FAILED | fail_closed=True | %s", exc)
+        bot.logger.exception("V75 PRE-RECONCILE REPAIR FAILED | fail_closed=True | %s", exc)
     return _original_reconcile_v74(self, *args, **kwargs)
 
 
 bot.Reconciler.reconcile = _reconcile_v75
-bot.VERSION = f"{bot.VERSION}-exact-owned-state-restore-v75"
+bot.VERSION = f"{bot.VERSION}-deterministic-orphan-repair-journal-proof-v75"
 
 
 def main():
     bot.logger.warning(
-        "EXACT OWNED STATE RESTORE V75 ACTIVE | proof=ledger_equals_physical+exact_durable_range_lots+existing_owner_basket | positions=UNTOUCHED orders=UNTOUCHED accounting=PRESERVED fail_closed=True"
+        "DETERMINISTIC RECONCILIATION V75 ACTIVE | "
+        "state_orphan_repair=BEFORE_OWNERSHIP_GUARD | "
+        "journal_ownership_proof=ENABLED | positions=UNTOUCHED_UNLESS_PROVEN_BOT_RESIDUAL"
     )
     base.main()
 
