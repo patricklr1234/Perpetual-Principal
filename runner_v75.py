@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Production storage-recovery bootstrap for V74.
+"""Perpetual Principal production entrypoint v75.
 
-Only removes/truncates the bot's disposable runtime log files when the mounted
-BOT_DIR is critically full. State, ledger, trade journal, order journal and
-other durable trading data are never deleted or modified here.
+V75 fixes a reconciliation deadlock in V74 without touching physical
+positions/orders. V69 already contains a narrowly proven repair that restores
+missing state legs from the durable ledger when ledger == physical and the
+missing durable lots are unambiguously owned by a live RANGE basket.
+
+V74 only reached that repair when inherited reconciliation failed. In the
+current incident inherited reconciliation can report success while the
+ledger/state projection is still missing a known owned leg. V75 therefore
+re-runs the existing V69 proof before V74's ownership guard.
+
+Safety:
+- state-only repair uses the existing V69 proof rules;
+- no market orders are sent;
+- physical positions and open orders are untouched;
+- bankroll/equity/RD/risk parameters are untouched by this wrapper;
+- unknown physical exposure remains quarantined, never adopted.
 """
 
 import os
@@ -19,7 +32,6 @@ def _recover_log_storage() -> None:
         usage = shutil.disk_usage(bot_dir)
         critical_free = 64 * 1024 * 1024
         if usage.free < critical_free:
-            # The log is disposable; durable trading state is deliberately untouched.
             try:
                 with log_file.open("w", encoding="utf-8"):
                     pass
@@ -31,19 +43,43 @@ def _recover_log_storage() -> None:
                 except Exception:
                     pass
     except Exception:
-        # Storage recovery must never prevent the normal V74 safety bootstrap.
         pass
 
 
 _recover_log_storage()
 
 import runner_v74 as base  # noqa: E402
+import runner_v69 as repair_base  # noqa: E402
+
+bot = base.bot
+_original_reconcile_v74 = bot.Reconciler.reconcile
 
 
-# Keep V74 as the trading implementation; this wrapper only makes the
-# persistent log self-healing before any logger is constructed.
+def _reconcile_v75(self, *args, **kwargs):
+    try:
+        repaired = repair_base._restore_missing_live_range_lots_v69(self)
+        if repaired:
+            bot.logger.warning(
+                "V75 STATE RESTORE RETRY | repairs=%s | positions=UNTOUCHED orders=UNTOUCHED",
+                repaired,
+            )
+    except Exception as exc:
+        bot.logger.exception(
+            "V75 STATE RESTORE RETRY FAILED | fail_closed=True | %s", exc
+        )
+    return _original_reconcile_v74(self, *args, **kwargs)
+
+
+bot.Reconciler.reconcile = _reconcile_v75
+bot.VERSION = f"{bot.VERSION}-state-restore-retry-v75"
+
 
 def main():
+    bot.logger.warning(
+        "STATE RESTORE RETRY V75 ACTIVE | "
+        "repair=durable-ledger-to-state-only | "
+        "positions=UNTOUCHED orders=UNTOUCHED"
+    )
     base.main()
 
 
